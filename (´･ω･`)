@@ -1,0 +1,1862 @@
+#! /usr/bin/python
+'''
+This python script implements the process of git integration
+Class Utility contains general helper function
+Class GitUtilities contains methods deal with git stuff
+Class GitIntegration contains methods deal with git integration
+Input argument should be get from command line and save in GitIntegration instance
+
+Input should have the format of:
+[-h] -qu QB_URL -ou OP_URL [-qn QB_NAME] [-on OB_NAME] -oqn
+OQB_NAME [-qs QB_START] [-os OP_START] [-qe QB_END]
+[-oe OP_END] [-rn REPO_NAME]
+
+$QB_URL, $OP_URL, $OQB_NAME are required, at least one of $QB_NAME, $OB_NAME is required
+$QB_NAME, $OB_NAME, $OQB_NAME can be sth like "origin/branch1", "opensource/branch1" or "branch1"
+since default name of remote are set as "origin" and "opensource",
+but $QB_NAME should not be "opensource/branch", $OB_NAME should not be "origin/branch1"
+$QB_START, $OP_START is the begin of commits integration, can be commit id, tag name or
+None(common ancestor of qb/ob and oqb)
+$QB_END, $OP_END is the end of commits integration, can be commit id, tag name or
+None(current HEAD of qb/ob)
+$REPO_NAME is sth specific for $git clone $QB_URL $REPO_NAME
+
+main() will finish one process of git integration if without error
+All error message will print
+If Conflict happens rebasing will abort and show commit id which causes conflict
+*It is assumed that $OQB_NAME and $QB_NAME should always exist in $QB_URL repo,
+and $OB_NAME always exists in $OP_URL repo
+*Push function is blocked
+(If $oqb is not exist, there is a option to choose whether to declare one)
+
+eg1:
+$./test.py -qu "git@bitbucket.org:qubole/hive-1.2.0.git"
+-ou "git://git.apache.org/hive.git" -qn "q-hive1_2-2.1.1"
+-on "branch-2.2" -oqn "q-hive1_2-2.1.1" -os "35cf0" -oe "10"
+This means in current dir, clone 'hive-1.2.0' if not existed, set opensource as "hive",
+from 'branch-2.2' in opensource repo get 10 commits after "35cf0"(not included)
+and apply them onto "q_hive1_2-2.1.1" if not conflicts
+eg2:
+./test.py -qu "https://github.com/SomeOne/SomeRepo.git"
+-ou "https://github.com/apache/hive.git"
+-on "branch-2.2" -oqn "opensource/branch-2.3"
+This means in current dir, clone 'SomeRepo' repo if not existed, set opensource as "hive",
+checkout a new branch from "opensource/branch-2.3" to local branch "branch-2.3",
+from 'branch-2.2' in opensource repo apply commits to "branch-2.3",
+after common ancestor of 'branch-2.2' and 'branch-2.3'
+(which will stop because of conflicts) print first conflict's commit id
+'''
+
+import os
+import subprocess
+from subprocess import Popen, PIPE
+import argparse
+import inspect
+
+
+class Utility:
+    '''
+    class Utility contains methods used in other classes
+    Vars: _TRUE, _FALSE
+    Methods:
+        @staticmethod:
+            pause(msg="")
+            show(msg)
+            show_err(err, where)
+            show_command(command)
+        @classmethod:
+            select(cls, msg)
+            get_keyboard_input(cls, msg)
+            show_help_msg(cls, help_msg)
+            compile(cls)
+            current_name(cls)
+            find_text_line_number(cls, file_dir, text)
+            remove_file(cls, file_name)
+    '''
+
+    _TRUE = True
+    _FALSE = False
+
+    def __init__(self):
+        return
+
+    @staticmethod
+    def pause(msg=""):
+        '''
+        pause inside the program
+        :param msg: pause msg
+        :type msg: str
+        '''
+        if msg:
+            print msg
+        raw_input("Press Enter to continue ...\n")
+
+    @classmethod
+    def select(cls, msg):
+        '''
+        get selection from keyboard [Y/N] and return it
+        :param msg: select message show on screen
+        :type msg: str
+        :return: if choose Y/y _TRUE else _FALSE
+        '''
+        res = raw_input(msg + " [Y/N]: ")
+        while not (res.lower() == "y" or res.lower() == "n"):
+            res = raw_input(msg + "[Y/N]: ")
+            print "Choice is %s, should be [Y/N]" % res
+        print "Choice is :", res
+        if res.lower() == "y":
+            return cls._TRUE
+        else:
+            return cls._FALSE
+
+    @classmethod
+    def get_keyboard_input(cls, msg):
+        '''
+        return input getting from keyboard
+        with $msg show on screen
+        :return: input from keyboard
+        '''
+        res = raw_input(msg)
+        return res.strip()
+
+    @staticmethod
+    def show(msg=""):
+        '''
+        print out msg
+        :type msg: str
+        '''
+        if msg:
+            print msg
+            print "--------------------------------------------------"
+        else:
+            print "=================================================="
+
+    @staticmethod
+    def show_err(err, where):
+        '''
+        print stderr msg
+        :param err: stderr msg
+        :type err: str
+        :param where: function that cause err
+        :type where: msg
+        '''
+        print "Err msg at %s:\n%s" % (where, err)
+
+    @staticmethod
+    def show_command(command):
+        '''
+        print command line
+        :param command: command line run by subprocess
+        :type command: str
+        '''
+        print "Run command line $%s\n" % command
+
+    @classmethod
+    def show_help_msg(cls, help_msg):
+        '''
+        print help message
+        :param help_msg: help message for debug
+        :type: str
+        '''
+        print "%s\n" % help_msg
+
+    @classmethod
+    def compile(cls):
+        '''
+        compile
+        '''
+        cls.show_command("mvn clean install -DskipTests -Pdist,hadoop-2")
+        os.system("mvn clean install -DskipTests -Pdist,hadoop-2")
+
+    @classmethod
+    def current_name(cls):
+        '''
+        return name of current function, which calls current_name
+        :return: name of function
+        :cite: https://stackoverflow.com/questions/5067604/determine-function-name-from-within-that-function-without-using-traceback
+        '''
+        return inspect.stack()[1][3]
+
+    @classmethod
+    def find_text_line_number(cls, file_dir, text):
+        '''
+        in $file_dir find and return line number of $text
+        :return: line number, if not found return -1
+        '''
+        res = -1
+        with open(file_dir) as myFile:
+            for num, line in enumerate(myFile, 1):
+                if text in line:
+                    res = num
+        if res < 0:
+            Utility.show_help_msg("No %s found in %s" % (text, file_dir))
+        else:
+            Utility.show_help_msg("%s found at line %d in %s" % (text, res, file_dir))
+        return res
+
+    @classmethod
+    def remove_file(cls, file_name):
+        '''
+        remove file $file_name in current dir
+        :return: null
+        '''
+        p = Popen(['rm', file_name], stderr=PIPE, stdout=PIPE)
+        out, err = p.communicate()
+        Utility.show_command("rm %s" % file_name)
+        if err:
+            Utility.show_err(err, Utility.current_name())
+        return
+
+
+class GitUtilities:
+    '''
+    GitUtilities contains methods dealing with git stuff
+    Those methods should be used in class GitUtilities and class GitIntegration
+    Vars: _TRUE, _FALSE, get from Utility
+         _CONFLICT_MSG, same in GitIntegration, means CONFLICT in rebasing
+    Methods: all @classmethod
+        # get information
+            get_tag_msg(cls, tag)
+            get_last_commit_contain_msg(cls, contain_msg)
+            get_last_commit(cls, where)
+            get_last_n_commit_id(cls, n, where="")
+            get_n_after_commit(cls, begin, n)
+            get_conflict_info(cls, msg)
+            get_last_commit_without_conflict(cls, where)
+            get_prev_id(cls, commit_id)
+            get_last_commit_id(cls, name)
+            get_status(cls)
+            check_status(cls, msg)
+            current_branch(cls)
+            current_dir(cls)
+            count_commits(cls, begin, end="")
+            check_count_commits(cls, begin, end="")
+            is_tag(cls, name)
+        # commit/branch/tag manipulation
+            add_empty_commit(cls, cmd_msg)
+            add_check_point_commit(cls, source_branch, start_tag, end_tag, last_d_commit, check_msg, init=_FALSE)
+            add_check_point_with_commit(cls, source_branch, start_commit, end_commit, last_d_commit, check_msg)
+            declare_tag(cls, tag_name, tag_msg="", where="")
+            checkout_branch(cls, branch_name, new=_FALSE, where="")
+            check_branch_exist(cls, branch_name)
+            check_branch_clean(cls, branch)
+            merge_base(cls, branch1, branch2)
+            local_name(cls, branch_name)
+            git_add_all(cls)
+        # rebase
+            rebase_onto(cls, upstream, pre, cur_head)
+            rebase(cls, upstream, cur="")
+            rebase_abort(cls)
+            resolve_conflict(cls, qb, oqb, rebase_start, rebase_end="")
+            rebase_skip(cls)
+            rebase_checkout_theirs(cls)
+            rebase_checkout_ours(cls)
+        # push
+            push_branch(cls, branch_name="", remote="origin")
+            push_tag(cls, tag_name="", remote="origin")
+            fetch(cls)
+        # delete
+            delete_tag(cls, tag_name, remote="")
+            delete_branch(cls, branch_name, remote="")
+            clean_temp_tags(cls, temp)
+        # repo manipulation
+            clone(cls, repo_url, repo_name="")
+            add_remote(cls, config_file, repo_url, remote_name="")
+            rm_repo(cls, repo_name)
+    '''
+
+    _TRUE = Utility._TRUE  
+    _FALSE = Utility._FALSE
+    _CONFLICT_MSG = ["CONFLICT", "patch failed"]
+
+    def __init__(self):
+        return
+
+    @classmethod
+    def get_tag_msg(cls, tag):
+        '''
+        this function is not used
+        get the name of $pre_tag which is saved in tag msg
+        $ git cat-file -p `git rev-parse $tag` | tail -n +6
+        :type tag: str
+        :return: msg saved in tag
+        eg: pre_tag contains message "v1_tag", then this method returns "v1_tag"
+        '''
+        Utility.show_help_msg("Try to get the tag name store in %s" % tag)
+        pre_commit_id = Popen(["git", "rev-parse", tag], stdout=PIPE).communicate()[0]
+        cmd = "git cat-file -p %s" % str(pre_commit_id)
+        p1 = Popen(cmd, stdout=PIPE, stderr=PIPE, shell=True)
+        Utility.show_command(cmd)
+        pre_tag = Popen(["tail", "-n", "+6"], stdin=p1.stdout, stdout=PIPE, stderr=PIPE).communicate()[0]
+        Utility.show("Get pre tag name %s" % pre_tag)
+        return pre_tag[:-1]  # delete \n
+
+    @classmethod
+    def get_last_commit_contain_msg(cls, contain_msg):
+        '''
+        get the most recent commit_id whose msg includes $contain_msg from current HEAD
+        contain_msg should not contain quote
+        $ git log -1 --grep $contain_msg --pretty="%H"
+        :param contain_msg: key msg want commit message should contain
+        :type contain_msg: str
+        :return: the most recent commit's id whose message contains $contain_msg
+        '''
+        Utility.show_help_msg("Try to get last commit in current branch contains '%s' in commit message" % contain_msg)
+        cmd = 'git log -1 --grep="%s" --pretty=%s' % (str(contain_msg), "%H")
+        p1 = Popen(cmd, stdout=PIPE, stderr=PIPE, shell=True)
+        out, err = p1.communicate()
+        Utility.show_command(cmd)
+        last_commit = out
+        if err:
+            Utility.show_err(err, Utility.current_name())
+        Utility.show("Last commit is %s which contains msg '%s'\n" % (last_commit[:-1], contain_msg))
+        return last_commit[:-1]  # delete \n at end
+
+    @classmethod
+    def get_last_commit(cls, where):
+        '''
+        get last commit from $where
+        $ git log -1 $where
+        :param where: some specific tag or branch
+        :type where: str
+        :return: last commit id in $git log $where
+        '''
+        p = Popen(['git', 'log', '-1', where], stdout=PIPE, stderr=PIPE)
+        out, err = p.communicate()
+        Utility.show_command('git log -1 %s' % where)
+        if err:
+            Utility.show_err(err, Utility.current_name())
+        # Utility.show("Last commit in %s is %s\n" % (where, out[:-1]))
+        return out[:-1] # delete \n
+
+    @classmethod
+    def add_empty_commit(cls, cmd_msg):
+        '''
+        add an empty commit at current HEAD, with commit message $cmd_msg
+        $ git commit --allow-empty -m $cmd_msg
+        :type cmd_msg: str
+        :param cmd_msg: commit message
+        :return: stdout, stderr
+        '''
+        p = Popen(['git', 'commit', '--allow-empty', '-m', cmd_msg], stdout=PIPE, stderr=PIPE)
+        out, err = p.communicate()
+        Utility.show_command("git commit --allow-empty -m '%s'" % cmd_msg)
+        if err:
+            Utility.show_err(err, Utility.current_name())
+        Utility.show_help_msg("Added empty commit %s to current HEAD" % cmd_msg)
+        return out, err
+
+    @classmethod
+    def add_check_point_commit(cls, source_branch, start_tag, end_tag, last_d_commit, check_msg, init=_FALSE):
+        '''
+        add check point commit to current HEAD
+        :type: all str
+        :param source_branch: from which branch we pick commits
+        :param start_tag: start tag of current rebasing process
+        :param end_tag: end tag of current rebasing process
+        :param last_d_commit: most recent check point commit before this one
+        :param check_msg: key message in check point commit,  "qubole rebase commit:"
+        :param init: default '_FALSE', if '_TRUE' then $start_tag will be considered as the beginning of $source_branch
+        eg of msg in check point commit:
+            $check_msg
+            $source_branch from (last commit in $start_tag)
+            to (last commit in $end_tag)
+            last check point commit is: $last_d_commit
+        '''
+        Utility.show_help_msg("Try to add rebase check point commit with key word '%s' to current branch" % (check_msg))
+        if init == cls._FALSE:
+            start_commit = cls.get_last_commit(start_tag)
+            end_commit = cls.get_last_commit(end_tag)
+            msg = "\n\n%s branch\nfrom: %s \n\nto: %s \n\nlast rebase commit: %s" \
+                  % (source_branch, start_commit, end_commit, last_d_commit)
+        elif init == cls._TRUE:
+            end_commit = cls.get_last_commit(end_tag)
+            msg = "\n\n%s branch\nfrom: start \n\nto: %s \n\nThis is initialization commit" % (source_branch, end_commit)
+        else:
+            Utility.show_err("Wrong default parameter 'init'", Utility.current_name())
+            return
+        cmd_msg = check_msg + ":" + msg
+        cls.add_empty_commit(cmd_msg)
+        Utility.show("Finish adding check point commit with key word '%s'" % check_msg)
+
+    @classmethod
+    def add_check_point_with_commit(cls, source_branch, start_commit, end_commit, last_d_commit, check_msg):
+        '''
+        add check point commit to current HEAD, with specific start commit and end commit
+        :param source_branch: from which branch we pick commits
+        :param start_commit: specific start
+        :param end_commit: specific end
+        :param last_d_commit: most recent check point commit before this one
+        :param check_msg: key message in check point commit, default "qubole rebase commit:"
+        :return: null
+        '''
+        msg = "\n\n%s branch\nfrom: %s \n\nto: %s \n\nlast rebase commit: %s" \
+                  % (source_branch, start_commit, end_commit, last_d_commit)
+        cmd_msg = check_msg + ":" + msg
+        cls.add_empty_commit(cmd_msg)
+        Utility.show("Finish adding check point commit with key word '%s'" % check_msg)
+
+    @classmethod
+    def declare_tag(cls, tag_name, tag_msg="", where=""):
+        '''
+        declare a new tag $tag_name at $where with message $tag_msg
+        $ git tag $tag_name [$where] [-m "$tag_msg"]
+        :type: all str
+        :param tag_name: name of tag
+        :param tag_msg: message of tag
+        :param where: if "" then current HEAD else $where, should be commit id or branch name or tag name
+        :return: stdout, stderr
+        '''
+        if tag_msg:
+            if not where:
+                p1 = Popen(['git', 'tag', tag_name, '-m', tag_msg], stdout=PIPE, stderr=PIPE)
+                out, err = p1.communicate()
+                Utility.show_command("git tag %s -m %s" % (tag_name, tag_msg))
+            else:
+                p1 = Popen(['git', 'tag', tag_name, where, '-m', tag_msg], stdout=PIPE, stderr=PIPE)
+                out, err = p1.communicate()
+                Utility.show_command("git tag %s %s-m %s" % (tag_name, where, tag_msg))
+            if err:
+                Utility.show_err(err, Utility.current_name())
+            Utility.show("Finish declare tag %s %s" % (tag_name, "at " + where if where else ""))
+            return out, err
+        else:
+            if not where:
+                p1 = Popen(['git', 'tag', tag_name], stdout=PIPE, stderr=PIPE)
+            else:
+                p1 = Popen(['git', 'tag', tag_name, where], stdout=PIPE, stderr=PIPE)
+            out, err = p1.communicate()
+            Utility.show_command("git tag %s %s" % (tag_name, where))
+            if err:
+                Utility.show_err(err, Utility.current_name())
+            Utility.show("Finish declare tag %s %s" % (tag_name, "at " + where if where else ""))
+            return out, err
+
+    @classmethod
+    def rebase_onto(cls, upstream, pre, cur_head):
+        '''
+        if $cur_head is branch, reset it as same as $upstream
+        if $cur_head is tag, reset a stemp branch as same as $upstream
+        get diff of $pre and $cur_head and apply those patches one by one on $cur_head
+        using interactive mode will cause error
+        $ git rebase --onto $upstream $pre $cur_head
+        :type: all str
+        :param upstream: branch rebase onto
+        :param pre: start of rebasing, can be branch, tag but not commit id
+        :param cur_head: current head, can be branch, tag but not commit id
+        :return: stdout, stderr
+        '''
+        cmd = 'git rebase --onto %s %s %s' % (upstream, pre, cur_head)
+        p1 = Popen(cmd, stdout=PIPE, stderr=PIPE, shell=True)
+        Utility.show_command(cmd)
+        out, err = p1.communicate()
+        if err:
+            Utility.show_err(err, Utility.current_name())
+        Utility.show("Ran rebase %s from %s onto %s" % (cur_head, pre, upstream))
+        return out, err
+
+    @classmethod
+    def rebase(cls, upstream, cur=""):
+        '''
+        rebase $cur to $upstream
+        if cur="", cur = current HEAD
+        interactive mode will cause error
+        $ git rebase $upstream [$cur]
+        :type: all str
+        :param upstream: branch or tag rebased onto
+        :param cur: if empty then current HEAD else branch or tag
+        :return: stdout, stderr
+        '''
+        if not cur:
+            p1 = Popen(['git', 'rebase', upstream], stdout=PIPE, stderr=PIPE)
+            out, err = p1.communicate()
+            Utility.show_command("git rebase %s" % upstream)
+        else:
+            p1 = Popen(['git', 'rebase', upstream, cur], stdout=PIPE, stderr=PIPE)
+            out, err = p1.communicate()
+            Utility.show_command("git rebase %s %s" % (upstream, cur))
+        if err:
+            Utility.show_err(err, Utility.current_name())
+        Utility.show("Finish rebase current branch to %s" % upstream)
+        return out, err
+
+    @classmethod
+    def rebase_abort(cls):
+        '''
+        $ git rebase --abort
+        :return: stdout, stderr
+        '''
+        p = Popen(['git', 'rebase', '--abort'], stdout=PIPE, stderr=PIPE)
+        out, err = p.communicate()
+        Utility.show_command("git rebase --abort")
+        if err:
+            Utility.show_err(err, Utility.current_name())
+        Utility.show_help_msg("Abort rebasing")
+        return out, err
+
+    # @classmethod
+    # def push_branch(cls, branch_name="", remote="origin"):
+    #     '''
+    #     push $branch_name to $remote
+    #     if branch_name:
+    #         $ git push $remote -u $branch_name
+    #     else:
+    #         $ git push
+    #     :type: all str
+    #     :param branch_name: name of branch to be pushed, if "" than push current branch
+    #     :param remote: default "origin"
+    #     :return: stdout, stderr
+    #     '''
+    #     if branch_name:
+    #         p = Popen(['git', 'push', remote, '-u', branch_name], stdout=PIPE, stderr=PIPE)
+    #     else:
+    #         p = Popen(['git', 'push'], stdout=PIPE, stderr=PIPE)
+    #     out, err = p.communicate()
+    #     Utility.show_command("git push %s" % ((remote + "-u" + branch_name) if branch_name else ""))
+    #     if err:
+    #         Utility.show_err(err, Utility.current_name())
+    #     Utility.show("%s pushed to %s" % ((branch_name if branch_name else GitUtilities.current_branch()), remote))
+    #     return out, err
+    #
+    # @classmethod
+    # def push_tag(cls, tag_name="", remote="origin"):
+    #     '''
+    #     push tag to remote
+    #     if $tag_name:
+    #         $ git push $remote $tag_name
+    #     else:
+    #         $ git push $remote --tags
+    #     :type: all str
+    #     :param tag_name: default ""
+    #     :param remote: default "origin"
+    #     :return: stdout, stderr
+    #     '''
+    #     if tag_name:
+    #         p1 = Popen(['git', 'push', remote, '-u', tag_name], stdout=PIPE, stderr=PIPE)
+    #         out, err = p1.communicate()
+    #         Utility.show_command("git push %s -u %s" % (remote, tag_name))
+    #     else:
+    #         p1 = Popen(['git', 'push', remote, '--tags'], stdout=PIPE, stderr=PIPE)
+    #         out, err = p1.communicate()
+    #         Utility.show_command("git push %s --tags" % remote)
+    #     if err:
+    #         Utility.show_err(err, Utility.current_name())
+    #     Utility.show("Finish push %s to %s" % ((tag_name if tag_name else "all tags"), remote))
+    #     return out, err
+
+    @classmethod
+    def fetch(cls):
+        '''
+        $ git fetch --all
+        :return: if success return _TRUE
+        '''
+        p = Popen(['git', 'fetch', '--all'], stdout=PIPE, stderr=PIPE)
+        out, err = p.communicate()
+        Utility.show_command("git fetch --all")
+        if err:
+            Utility.show_err(err, Utility.current_name())
+        if "error: Could not fetch" in err or "fatal:" in err:
+            return cls._FALSE
+        return cls._TRUE
+
+    @classmethod
+    def current_branch(cls):
+        '''
+        get name of current branch
+        $ git branch | sed -n '/\* /s///p'
+        :return: current branch's name
+        :cite: https://stackoverflow.com/questions/6245570/how-to-get-the-current-branch-name-in-git
+        '''
+        cmd = "git branch | sed -n '/\* /s///p'"
+        p = Popen(cmd, stdout=PIPE, stderr=PIPE, shell=True)
+        out, err = p.communicate()
+        if err:
+            Utility.show_err(err, Utility.current_name())
+        Utility.show("Current branch is %s" % out[:-1])
+        return out[:-1]  # delete \n
+
+    @classmethod
+    def current_dir(cls):
+        '''
+        get current directory
+        $ pwd
+        :return: current dir
+        '''
+        p = Popen(['pwd'], stdout=PIPE, stderr=PIPE)
+        out, err = p.communicate()
+        if err:
+            Utility.show_err(err, Utility.current_name())
+        Utility.show_help_msg("Current dir is %s" % out[:-1])
+        return out[:-1]  # delete \n
+
+    @classmethod
+    def checkout_branch(cls, branch_name, new=_FALSE, where=""):
+        '''
+        checkout [-b] $branch_name [$where]
+        if $branch_name is a tag, end in checkout at a temp branch
+        if new==_FALSE:
+            $ git checkout $branch_name [$where]
+        elif new==_TRUE:
+            $ git checkout -b $branch_name [$where]
+        :type: all str
+        :param branch_name: name of branch to checkout
+        :param new: default _FALSE, if _TRUE checkout a new branch with name $branch_name
+        :param where: default "", if not empty checkout at specific commit id
+        :return: stdout, stderr
+        '''
+        if new == cls._FALSE:
+            if not where:
+                p1 = Popen(['git', 'checkout', branch_name], stdout=PIPE, stderr=PIPE)
+            else:
+                p1 = Popen(['git', 'checkout', branch_name, where], stdout=PIPE, stderr=PIPE)
+            out, err = p1.communicate()
+            Utility.show_command("git checkout %s" % branch_name + " " + where)
+        elif new == cls._TRUE:
+            if not where:
+                p1 = Popen(['git', 'checkout', '-b', branch_name], stdout=PIPE, stderr=PIPE)
+            else:
+                p1 = Popen(['git', 'checkout', '-b', branch_name, where], stdout=PIPE, stderr=PIPE)
+            out, err = p1.communicate()
+            Utility.show_command("git checkout -b %s" % branch_name + " " + where)
+        else:
+            out = ""
+            err = "Wrong default parameter 'new' in checkout_branch"
+        if err:
+            Utility.show_err(err, Utility.current_name())
+        cls.current_branch()
+        return out, err
+
+    @classmethod
+    def check_branch_exist(cls, branch_name):
+        '''
+        check whether $branch_name exist in current repo
+        if not exist, select whether to exit
+        if exist checkout $branch_name
+        :param branch_name: name of branch
+        :return: _TRUE if exist else _FALSE
+        '''
+        b_out, b_err = GitUtilities.checkout_branch(branch_name)
+        if "did not match any file(s) known to git" in b_err:
+            Utility.show_help_msg("Branch %s does not exist" % branch_name)
+            # choice = Utility.select("Exit?")
+            # if choice == "y":
+            #     exit()
+            # else:
+            #     Utility.pause("Pause because branch %s does not exist" % branch_name)
+            return cls._FALSE
+        else:
+            Utility.show_help_msg("Branch %s exists and checkout" % branch_name)
+            return cls._TRUE
+
+    @classmethod
+    def merge_base(cls, branch1, branch2):
+        '''
+        Return commit id which is merge base of $branch1 and $branch2
+        :param branch1: name of branch
+        :param branch2: name of branch
+        :return: commit id
+        '''
+        p = Popen(['git', 'merge-base', branch1, branch2], stdout=PIPE, stderr=PIPE)
+        out, err = p.communicate()
+        Utility.show_command("git merge-base %s %s" % (branch1, branch2))
+        if err:
+            Utility.show_err(err, Utility.current_name())
+        if out:
+            Utility.show("Merge base of %s and %s is %s" % (branch1, branch2, out[:-1]))
+            return out[:-1]  # delete '\n'
+        else:
+            Utility.show("No merge base of %s and %s" % (branch1, branch2))
+            return ""
+
+    @classmethod
+    def delete_tag(cls, tag_name, remote=""):
+        '''
+        delete tag in local repo or remote repo
+        if remote:
+            $ git push $remote --delete $tag_name
+        else:
+            $ git tag -d $tag_name
+        :param tag_name: name of tag
+        :param remote: name of remote repo
+        :return: stdout, stderr
+        '''
+        if not remote:
+            p = Popen(['git', 'tag', '-d', tag_name], stdout=PIPE, stderr=PIPE)
+            out, err = p.communicate()
+            Utility.show_command("git tag -d %s" % tag_name)
+        else:
+            p = Popen(['git', 'push', remote, '--delete', tag_name], stdout=PIPE, stderr=PIPE)
+            out, err = p.communicate()
+            Utility.show_command("git push %s --delete %s" % (remote, tag_name))
+        if err:
+            Utility.show_err(err, Utility.current_name())
+        Utility.show("Deleted tag %s %s" % (remote, tag_name))
+        return out, err
+
+    @classmethod
+    def delete_branch(cls, branch_name, remote=""):
+        '''
+        delete branch in local repo or remote repo
+        if remote:
+            $ git push $remote --delete $name
+        else:
+            $ git branch -D $branch_name
+        :type: all str
+        :param branch_name: name of branch
+        :param remote: default ""
+        :return: stdout, stderr
+        '''
+        if not remote:
+            p = Popen(['git', 'branch', '-D', branch_name], stdout=PIPE, stderr=PIPE)
+            out, err = p.communicate()
+            Utility.show_command("git branch -D %s" % branch_name)
+        else:
+            p = Popen(['git', 'push', remote, '--delete', branch_name], stdout=PIPE, stderr=PIPE)
+            out, err = p.communicate()
+            Utility.show_command("git push %s --delete %s" % (remote, branch_name))
+        if err:
+            Utility.show_err(err, Utility.current_name())
+        Utility.show("Finish delete %s %s" % (remote, branch_name))
+        return out, err
+
+    @classmethod
+    def clean_temp_tags(cls, temp_tags):
+        '''
+        clean temp tags
+        :type temp_tags: list of str
+        :param temp_tags: list of temp tags name
+        '''
+        for t in temp_tags:
+            cls.delete_tag(t)
+        Utility.show("Cleaned temp tags")
+
+    @classmethod
+    def get_conflict_info(cls, msg):
+        '''
+        in rebase process, get current commit id when meeting conflicts
+        :type: all str
+        :param msg: stderr message given by git
+        :return: commit_id which causes conflict, where conflict happens ('0001' in eg)
+        :cite: https://stackoverflow.com/questions/2118364/how-to-identify-conflicting-commits-by-hash-during-git-rebase
+        eg:
+        git gives the following msg:
+            "bla... Patch failed at 0001 commit message for ...bla"
+        then run command:
+            $ head -1 .git/rebase-apply/0001
+        it will give:
+            From ad1c7739c1152502229e3f2ab759ec5323988326 Mon Sep 17 00:00:00 2001
+        '''
+        Utility.show_help_msg("Try to get commit id which causes CONFLICT")
+        fail_msg = "Patch failed at"
+        idx = msg.find(fail_msg)
+        if idx < 0:
+            Utility.show_err("Not found fail_msg in input", Utility.current_name())
+        # '0001' in eg, where in rebase-apply conflict happens
+        where = (msg[idx:].split(":")[0]).split(" ")[3]
+        cmd = "head -1 .git/rebase-apply/%s" % (where)
+        p1 = Popen(cmd, stdout=PIPE, stderr=PIPE, shell=True)
+        out, err = p1.communicate()
+        Utility.show_command(cmd)
+        if err:
+            Utility.show_err(err, Utility.current_name())
+        # out should be sth like "From ad1c7739c1152502229e3f2ab759ec5323988326 Mon Sep 17 00:00:00 2001"
+        commit_id = out.split(" ")[1]
+        Utility.show("Current CONFLICT at %s from rebase_head with id %s" % (where, commit_id))
+        return commit_id, where
+
+    @classmethod
+    def conflict_id_during_rebase(cls):
+        '''
+        return commit id which generate current CONFLICT during rebasing process
+        cite: https://stackoverflow.com/questions/2118364/how-to-identify-conflicting-commits-by-hash-during-git-rebase
+        :return: commit id causing CONFLICT
+        '''
+        cmd = "cat .git/rebase-apply/original-commit"
+        p = Popen(cmd, stdout=PIPE, stderr=PIPE, shell=True)
+        out, err = p.communicate()
+        if err:
+            Utility.show_err(err, Utility.current_name())
+        return out[:-1] # delete \n at end
+
+    @classmethod
+    def get_last_commit_without_conflict(cls, where):
+        '''
+        from info getting from get_conflict_info(self, msg)
+        get the last commit's id without conflict
+        $ head -1 .git/rebase-apply/someplace
+        :param where: place which cause conflict in rebase-apply
+        :return: commit id which is the last one without conflict
+        eg:
+        git gives message:
+            msg = "bla...Patch failed at 0003 commit message for ...bla"
+        run:
+            commit_id, where = get_conflict_info(self, msg)
+            pre_id = get_prev_id(where)
+        now pre_id is the last commit's id without conflict
+        '''
+        place = str(int(where) - 1)  # '0003' -> 2
+        place = "0" * (4 - len(place)) + place  # 2 -> '0002'
+        cmd = "head -1 .git/rebase-apply/%s" % (place)
+        p1 = Popen(cmd, stdout=PIPE, stderr=PIPE, shell=True)
+        # stdout should be sth like "From ad1c7739c1152502229e3f2ab759ec5323988326 Mon Sep 17 00:00:00 2001"
+        pre_id = p1.communicate()[0].split(" ")[1]
+        Utility.show_command(cmd)
+        Utility.show("Last commit without conflict is %s" % pre_id)
+        return pre_id
+
+    @classmethod
+    def get_prev_id(cls, commit_id):
+        '''
+        get previous commit id before specific id $commit_id
+        $ git log $commit_id^1 -1 --pretty=%H
+        :type: all str
+        :param commit_id: commit id after what we want
+        :return: commit id before $commit_id
+        '''
+        Utility.show_help_msg("Try to get previous commit id before %s\n" % commit_id)
+        cmd = "git log %s^1 -1 --pretty=%s" % (commit_id, "%H")
+        p1 = Popen(cmd, stdout=PIPE, stderr=PIPE, shell=True)
+        pre_id_1, err = p1.communicate()
+        Utility.show_command(cmd)
+        if err:
+            Utility.show_err(err, Utility.current_name())
+        Utility.show_help_msg("Commit id before %s is %s" % (commit_id, pre_id_1[:-1]))
+        return pre_id_1[:-1]  # delete \n
+
+    @classmethod
+    def count_commits(cls, begin, end=""):
+        '''
+        count total number of commits from $begin to $end
+        if end_commit:
+            $ git rev-list $begin..$end | wc -l
+        else:
+            $ git rev-list $begin..HEAD | wc -l
+        :type: all str
+        :param begin: begin of counting, commit id or tag or branch
+        :param end: default ""
+        :return: total number of commits (int)
+        '''
+        if not end:
+            cmd = "git rev-list %s..HEAD | wc -l" % (begin)
+        else:
+            cmd = "git rev-list %s..%s | wc -l" % (begin, end)
+        p = Popen(cmd, stdout=PIPE, stderr=PIPE, shell=True)
+        out, err = p.communicate()
+        Utility.show_command(cmd)
+        if err:
+            Utility.show_err(err, Utility.current_name())
+        #Utility.show("Total number of commits is : %d" % int(out))
+        return int(out)
+
+    @classmethod
+    def get_last_n_commit_id(cls, n, where=""):
+        '''
+        get last nth commit id from $where
+        if not where:
+            $ git rev-list HEAD -n
+        else:
+            $ git rev-list $where -n
+        :type n: int
+        :param n: place
+        :param where: default "" can be name of tag or branch or commit id
+        :return: the last nth commit id
+        '''
+        if not where:
+            cmd = "git rev-list HEAD -%d" % n
+        else:
+            cmd = "git rev-list '%s' -%d" % (where, n)
+        p = Popen(cmd, stdout=PIPE, stderr=PIPE, shell=True)
+        out, err = p.communicate()
+        Utility.show_command(cmd)
+        if err:
+            Utility.show_err(err, Utility.current_name())
+        commit_id = out.split("\n")[n - 1]  # nth last
+        Utility.show("Last %d commit is %s" % (n, commit_id))
+        return commit_id
+
+    @classmethod
+    def get_n_after_commit(cls, begin, n):
+        '''
+        get $nth commit id after $begin
+        total = check_count_commits(begin)
+        if total > n:
+            $ git rev-list $commit..HEAD -(total - n)
+        else:
+            $ git rev-list $commit..HEAD -1
+        :type: all str
+        :param n: nth (str)
+        :param begin: specific commit id or tag or branch
+        :return: nth commit or current HEAD id after $begin
+        '''
+        num = int(n)
+        Utility.show_help_msg("Try to get %dth commit id after %s" % (num, begin))
+        total_num = cls.check_count_commits(begin)
+        remain_num = total_num - num + 1 if total_num > num else 1
+        commit_id = cls.get_last_n_commit_id(remain_num)
+        Utility.show("Get the %dth commit id after %s is %s" % (int(n), begin, commit_id))
+        return commit_id
+
+    @classmethod
+    def get_last_commit_id(cls, name):
+        '''
+        get last commit id, no matter $name is branch, tag or commit_id
+        :param name: branch name, tag name or simple commit id
+        :return: last commit id if $name is tag or branch name, or itself if $name is commit id
+        '''
+        p = Popen(['git', 'show', name], stdout=PIPE, stderr=PIPE)
+        out, err = p.communicate()
+        Utility.show_command("git show %s" % name)
+        if err:
+            Utility.show_err(err, Utility.current_name())
+        msg = out[:-1] # delete \n at the end
+        idx = msg.find("commit")
+        if idx < 0:
+            Utility.show_err("Not found commit", Utility.current_name())
+        # msg is sth like commit 1af77bbf8356e86cabbed92cfa8cc2e1470a1d5c Author....bla
+        cur_id = (msg[idx:].split()[1])
+        return cur_id
+
+    @classmethod
+    def check_count_commits(cls, begin, end=""):
+        '''
+        when merge happens in current branch, the count number of commits by rev-list and log
+        may have difference due to merge, so check whether we find the right number
+        :param begin: begin of count, can be tag name, commit id, branch name
+        :param end: end of count, can be tag name, commit id, branch name, if empty current HEAD
+        :return: count number found by text
+        '''
+        Utility.show_help_msg("Find total count from %s to %s end in text" %
+                              (begin, end if end else "current HEAD"))
+        num_find = cls.count_commits(begin, end)
+        tmp_file = "tmp_log_output"
+        cmd = "git log %s --oneline --pretty=%s -%d > %s" % (end if end else "HEAD", "%H", num_find+1, tmp_file)
+        p = Popen(cmd, stdout=PIPE, stderr=PIPE, shell=True)
+        out, err = p.communicate()
+        if err:
+            Utility.show_err(err, Utility.current_name())
+        cur_file = GitUtilities.current_dir() + "/" + tmp_file
+        cur_id = GitUtilities.get_last_commit_id(begin)
+        num_check = Utility.find_text_line_number(cur_file, cur_id) -1
+        if num_check != num_find:
+            Utility.show("[Note] There will be a merge in rebsing process, which contains %d commits" % (num_find - num_check))
+        Utility.show("Count commits from %s to %s is %d" % (begin, end if end else "current HEAD", num_check))
+        Utility.remove_file(tmp_file)
+        return num_check
+
+    @classmethod
+    def get_status(cls):
+        '''
+        get current status
+        $ git status
+        :return: current status
+        '''
+        p1 = Popen(['git', 'status'], stdout=PIPE, stderr=PIPE)
+        out, err = p1.communicate()
+        Utility.show_command("git status")
+        if err:
+            Utility.show_err(err, Utility.current_name())
+        Utility.show_help_msg("Current status is %s" % out)
+        return out
+
+    @classmethod
+    def check_status(cls, msg):
+        '''
+        check status of current branch
+        if stdout contains $msg return _TRUE, else return $_FALSE
+        :param msg: eg: "working tree clean"
+        :return: _TRUE or _FALSE
+        '''
+        status = cls.get_status()
+        if not msg in status:
+            Utility.show("Current status is not %s" % msg)
+            return cls._FALSE
+        else:
+            Utility.show("Current status %s" % msg)
+            return cls._TRUE
+
+    @classmethod
+    def check_branch_clean(cls, branch):
+        '''
+        Checking if $branch exists and working tree clean
+        If branch exist will checkout at that branch
+        :param branch: name of branch
+        :return: _TRUE or _FALSE
+        '''
+        ext = cls.check_branch_exist(branch)
+        sta = cls.check_status("working tree clean")
+        if ext == cls._FALSE or sta == cls._FALSE:
+            Utility.show("False checking branch %s" % branch)
+            return cls._FALSE
+        else:
+            Utility.show("True checking branch %s" % branch)
+            return cls._TRUE
+
+    @classmethod
+    def clone(cls, repo_url, repo_name=""):
+        '''
+        clone git repo with $url as $repo_name
+        if $repo_name:
+            $ git clone $url $repo_name
+        else:
+            $ git clone $url
+        :type: all str
+        :param repo_url: url of repo
+        :param repo_name: clone as $repo_name
+        :return: stdout, stderr
+        '''
+        if not repo_name:
+            p1 = Popen(['git', 'clone', repo_url], stdout=PIPE, stderr=PIPE)
+        else:
+            p1 = Popen(['git', 'clone', repo_url, repo_name], stdout=PIPE, stderr=PIPE)
+        out1, err1 = p1.communicate()
+        Utility.show_command("git clone %s %s" % (repo_url, repo_name))
+        if err1:
+            Utility.show_err(err1, Utility.current_name())
+        Utility.show("Finish clone from %s %s" % (repo_url, repo_name))
+        return out1, err1
+
+    @classmethod
+    def add_remote(cls, repo_url, remote_name):
+        '''
+        add remote $remote_name with url $repo_url
+        :type: all str
+        :param repo_url: url of remote repo
+        :param remote_name: default "opensource"
+        '''
+        # msg = '[remote "%s"]\n    url = %s\n    fetch = +refs/heads/*:refs/remotes/%s/*' \
+        #       % (remote_name, repo_url, remote_name)
+        # Utility.show_help_msg("Try to add %s\nat the end of file %s" % (msg, config_file))
+        # f = open(config_file, "a")  # append mode
+        # f.write(msg)
+        # f.close()
+        Utility.show_help_msg("Add remote repo %s" % remote_name)
+        p = Popen(['git', 'remote', 'add', remote_name, repo_url], stdout=PIPE, stderr=PIPE)
+        out, err = p.communicate()
+        Utility.show_command("git remote add %s %s" % (remote_name, repo_url))
+        if err:
+            Utility.show_err(err, Utility.current_name())
+        Utility.show("Finish add %s as %s" % (repo_url, remote_name))
+        return
+
+    @classmethod
+    def rm_repo(cls, repo_name):
+        '''
+        remove $repo_name from current directory
+        $ rm -rf $repo_name
+        :return: stdout, stderr
+        '''
+        cmd = "rm -rf %s" % repo_name
+        p = Popen(cmd, stdout=PIPE, stderr=PIPE, shell=True)
+        out, err = p.communicate()
+        Utility.show_command(cmd)
+        if err:
+            Utility.show_err(err, Utility.current_name())
+        if not out:
+            Utility.show("Removed repo %s" % repo_name)
+        return out, err
+
+    @classmethod
+    def is_tag(cls, name):
+        '''
+        check whether $name is tag
+        $ git tag -l | grep $name
+        :return: if $name is tag return $name else return ""
+        '''
+        Utility.show_help_msg("Check whether %s is tag or not" % name)
+        cmd = "git tag -l | grep %s" % ("^" + name + "$")
+        p = Popen(cmd, stdout=PIPE, stderr=PIPE, shell=True)
+        out, err = p.communicate()
+        Utility.show_command(cmd)
+        if err:
+            Utility.show_err(err, Utility.current_name())
+        if out:
+            Utility.show_help_msg("%s is tag" % name)
+            return name
+        else:
+            Utility.show_help_msg("%s is not tag" % name)
+            return ""
+
+    @classmethod
+    def local_name(cls, branch_name):
+        '''
+        if $branch_name is remote/name, return name
+        :param branch_name: input
+        :return: name of branch without remote
+        '''
+        if "/" in branch_name:
+            branch_name = branch_name.split("/")[-1]
+        return branch_name
+
+    @classmethod
+    def resolve_conflict(cls):
+        '''
+        resolve conflict when rebaseing, at the middle of script
+        the script will pause at the middle and open another terminal window for resolving
+        *possibly just for MAC
+        :return: null
+        '''
+        help_msg = "***************************************************************************" \
+                   "\n[Note]: Now this python script is paused." \
+                   "\n        To resolve CONFLICT: open another terminal window, cd to current dir" \
+                   "\n        after resolving CONFLICT, run command lines" \
+                   "\n        `git add .` and `git rebase --continue`" \
+                   "\n        Then press ENTER to continue this python script." \
+                   "\n        *In Class GitUtilities, this method only designed for MAC" \
+                   "\n        *If 'No changes' run `git rebase --skip`" \
+                   "\n***************************************************************************\n"
+        print help_msg
+        dir = cls.current_dir()
+        # this command only test in MAC
+        cmd = "osascript -e 'tell application \"Terminal\" to do script \"cd %s\" & \"; git status \"'" % dir
+        p = Popen(cmd, stdout=PIPE, stderr=PIPE, shell=True)
+        out, err = p.communicate()
+        Utility.show_command(cmd)
+        if err:
+            Utility.show_err(err, Utility.current_name())
+        Utility.pause()
+        Utility.show("Resolved conflicts manually")
+        return
+
+    @classmethod
+    def rebase_skip(cls):
+        '''
+        skip empty patches during rebase
+        $git rebase --skip
+        :return: stdout, stderr
+        '''
+        p = Popen(['git', 'rebase', '--skip'], stdout=PIPE, stderr=PIPE)
+        out, err = p.communicate()
+        Utility.show_command("git rebase --skip")
+        if err:
+            Utility.show_err(err, Utility.current_name())
+        Utility.show_help_msg("Skip current patch")
+        return out, err
+
+    @classmethod
+    def rebase_checkout_ours(cls):
+        '''
+        when meeting conflict in rebasing, only pick 'ours' commits
+        $git checkout . --ours
+        :return: stdout, stderr
+        '''
+        cmd = "git checkout . --ours"
+        p = Popen(cmd, stdout=PIPE, stderr=PIPE, shell=True)
+        out, err = p.communicate()
+        Utility.show_command(cmd)
+        if err:
+            Utility.show_err(err, Utility.current_name())
+        return out, err
+
+    @classmethod
+    def rebase_checkout_theirs(cls):
+        '''
+        when meeting conflicts in rebasing, only pick 'theris' commits
+        $git checkout . --theirs
+        :return: stdout, stderr
+        '''
+        cmd = "git checkout . --theirs"
+        p = Popen(cmd, stdout=PIPE, stderr=PIPE, shell=True)
+        out, err = p.communicate()
+        Utility.show_command(cmd)
+        if err:
+            Utility.show_err(err, Utility.current_name())
+        return out, err
+
+    @classmethod
+    def git_add_all(cls):
+        '''
+        add all changes to current branch
+        $git add .
+        :return: stdout, stderr
+        '''
+        cmd = "git add ."
+        p = Popen(cmd, stderr=PIPE, stdout=PIPE, shell=True)
+        out, err = p.communicate()
+        Utility.show_command(cmd)
+        if err:
+            Utility.show_err(err, Utility.current_name())
+        return out, err
+
+
+class GitIntegration:
+    '''
+    GitIntegration class contains methods for git integration
+    Class vars:
+        # get from Utility
+            _TRUE, _FALSE
+        # for git integration
+            _ORIGIN, _OPENSOURCE, _CONFIG_FILE, _STATUS_MSG
+            _CHECK_POINT_MSG, _CONFLICT_MSG, _TMP_PRE_TAG
+    Instance vars (input):
+        # url of repo: qb_url, op_url (required)
+        # name of branch: qb_name, op_name, oqb_name (required)
+        # rebase point: qb_start, op_start, qb_end, op_end (one of qb_start/op_start is required)
+        # name of repo: repo_name
+    Methods:
+        # constructor
+            7 normal inputs, 3 default inputs for each instance
+            __init__(self, qb_repo_url, op_repo_url, qb_branch_name, op_branch_name, oqb_branch_name,
+            qb_rebase_start, op_rebase_start, qb_rebase_end="", op_rebase_end="", repo_name ="")
+        # git integration
+            # instance methods
+            set_up(self, existed=_FALSE, repo_name="")
+            clean(self)
+            check_oqb(self)
+            integrate_branches(self)
+            # class methods
+            check_rebase_start(cls, qb, oqb, rebase_start)
+            end_integration(cls, pre_tag, qb_tag, oqb, temp_tags)
+            abort_integration(self, qb, pre_tag, conflict_id, temp_tags)
+            rebase_middle_save(cls, source_branch, rebase_start, temp_save_tag="v_tmp_save_point")
+            integrate_commits(self, qb, oqb, rebase_start, rebase_end="", rebase_until_conflict=_FALSE)
+            initialize_oqb(self, qb_branch, op_branch, oqb_branch,
+                            pre_qtag="", pre_otag="", qb_commit="", op_commit="", merge_base=_FALSE)
+
+    '''
+
+    # remote name of qubole repo, default "origin"
+    _ORIGIN = "origin"
+    # remote name of opensource repo, default "opensource"
+    _OPENSOURCE = "opensource"
+    # key word in rebase check point commits, default "qubole rebase commit"
+    _CHECK_POINT_MSG = "qubole rebase commit"
+    # key word to check whether rebasing meet conflicts
+    _CONFLICT_MSG = ["CONFLICT", "patch failed", "No changes"]
+    # key word to check whether rebasing meet conflicts in git status
+    _STATUS_MSG = ["Unmerged paths", "conflicts"]
+    # config file in git repo, default ".git/config", seems no use here
+    _CONFIG_FILE = ".git/config"
+    # if rebase start as a commit id, declare a temp tag for it and delete it later
+    _TMP_PRE_TAG = "tmp_pre_tag"
+    # get from class Utility
+    _TRUE = Utility._TRUE
+    _FALSE = Utility._FALSE
+
+    def __init__(self, qb_repo_url, op_repo_url, qb_branch_name, op_branch_name, oqb_branch_name,
+                 qb_rebase_start, op_rebase_start, qb_rebase_end="", op_rebase_end="", repo_name =""):
+        self.qb_url = qb_repo_url
+        self.op_url = op_repo_url
+        self.qb_name = qb_branch_name
+        self.op_name = op_branch_name
+        self.oqb_name = oqb_branch_name
+        self.qb_start = qb_rebase_start
+        self.op_start = op_rebase_start
+        self.qb_end = qb_rebase_end
+        self.op_end = op_rebase_end
+        self.repo_name = repo_name
+
+
+    def set_up(self, existed=_FALSE, repo_name=""):
+        '''
+        if existed=_FALSE
+        if repo whose url is $qb_url exists in current dir, select whether delete it or not
+        if select to delete, delete existed repo and clone a new repo at current dir
+        else clone repo $qb_url with other name, typing from keyboard
+        set remote $op_url in $_CONFIG_FILE as $_OPENSOURCE
+        change dir to new repo just cloned
+        if existed=_TRUE, go to existed repo $repo_name, do not add remote
+        :param existed: default _FALSE, if _TRUE change dir to existed repo $repo_name
+        :return: _TRUE if success else _FALSE
+        '''
+        if Utility.select("Repo already exit?") == self._TRUE:
+            repo_name = Utility.get_keyboard_input("Input repo dir:")
+            Utility.show_help_msg("Change directory to %s" % repo_name)
+            os.chdir(repo_name)
+            if not repo_name:
+                Utility.show("No repo name, false set up")
+                return self._FALSE
+            cur_dir = GitUtilities.current_dir()
+            # new_dir = cur_dir + "/" + repo_name
+            # os.chdir(new_dir)
+            GitUtilities.current_dir()
+            op_name = Utility.get_keyboard_input("Input openosurce repo remote name(default 'opensource'):")
+            if self._OPENSOURCE != op_name:
+                GitUtilities.add_remote(self.op_url, op_name)
+                self._OPENSOURCE = op_name
+            return self._TRUE
+        Utility.show_help_msg("Now set up repo and remote branch")
+        out, err = GitUtilities.clone(self.qb_url, repo_name=self.repo_name)
+        while "already exists" in err:
+            # eg for err: "fatal: destination path 'QB' already exists and is not an empty directory."
+            repo_name = err.split()[3][1:-1] # delete single quote
+            if self._TRUE == Utility.select("%s already exists, remove it?" % repo_name):
+                Utility.show_help_msg("Clear existed repo %s and clone a new one from %s" % (repo_name, self.qb_url))
+                GitUtilities.rm_repo(repo_name)
+                out, err = GitUtilities.clone(self.qb_url, repo_name)
+            else:
+                repo_name_new = Utility.get_keyboard_input("Enter a new repo name: ")
+                out, err = GitUtilities.clone(self.qb_url, repo_name_new)
+        else:
+            # eg of err: "Cloning into 'QB'... bla"
+            repo_name = err.split()[2][1:-4]  # remove quote and '...'
+        self.repo_name = repo_name
+        Utility.show_help_msg("Repo name is %s" % self.repo_name)
+        # dir of qubole repo
+        dir = GitUtilities.current_dir() + "/" + self.repo_name
+        # change to repo dir
+        os.chdir(dir)
+        GitUtilities.current_dir()
+        # add op_url to remote
+        GitUtilities.add_remote(self.op_url, self._OPENSOURCE)
+        if GitUtilities.fetch() == self._FALSE:
+            Utility.show("Set up fault due to error in fetch")
+            return self._FALSE
+        Utility.show("Finish set up %s as %s, with %s as remote %s"
+                     % (self.qb_url, self.repo_name, self.op_url, self._OPENSOURCE))
+        return self._TRUE
+
+    def clean(self):
+        '''
+        remove repo clone from $qb_url
+        :return: _TRUE if clean else _FALSE
+        '''
+        select = Utility.select("Remove repo %s?" % self.repo_name)
+        if select == self._TRUE:
+            cur_dir = GitUtilities.current_dir()
+            parent_dir = cur_dir[:cur_dir.rfind("/")]
+            if self.repo_name in cur_dir:
+                os.chdir(parent_dir)
+                Utility.show_command("cd %s" % parent_dir)
+            GitUtilities.current_dir()
+            out, err = GitUtilities.rm_repo(self.repo_name)
+            if not out and not err:
+                return self._TRUE
+        return self._FALSE
+
+    @classmethod
+    def check_rebase_start(cls, qb, oqb, rebase_start):
+        '''
+        Check $rebase_start which in command $git rebase --onto $oqb $rebase_start $qb
+        if $rebase_start not tag name, make tag _TMP_PRE_TAG at $rebase_start
+                if $rebase_start is "", set $rebase_start to merge base of $qb and $oqb
+                    if no common ancestor $qb and $oqb, set $rebase_start to last commit of $oqb
+        finally $rebase_start will be a name of tag, save in var $pre_tag
+        :return: tag name
+        '''
+        Utility.show_help_msg("Check start point of rebase, which is %s" % rebase_start)
+        # if empty $rebase_start set to merge base of $qb and $oqb
+        if not rebase_start:
+            rebase_start = GitUtilities.merge_base(qb, oqb)
+            # if no merge base, set $rebase_start to last commit of $oqb
+            if not rebase_start:
+                Utility.show_help_msg("No common ancestor, set rebase start at current HEAD of %s" % oqb)
+                # use remote name in case current HEAD is temp, which will end in not found $oqb
+                rebase_start = GitUtilities.get_last_n_commit_id(1, cls._ORIGIN + "/" + oqb)
+        tag_out = GitUtilities.is_tag(rebase_start)
+        if tag_out:
+            pre_tag = tag_out
+        else:
+            GitUtilities.checkout_branch(qb)
+            pre_tag = cls._TMP_PRE_TAG
+            GitUtilities.declare_tag(pre_tag, where=rebase_start)
+        return pre_tag
+
+    @classmethod
+    def integrate_commits(cls, qb, oqb, rebase_start, rebase_end="", rebase_until_conflict=_FALSE):
+        '''
+        get commits on branch $qb from $rebase_start to $rebase_end (or current HEAD), apply to $oqb
+        Process:
+            1. check input:
+                $qb, $oqb should exist in current repo,  working tree should be clean if local
+                if $rebase_start not a tag name, make _TMP_PRE_TAG at $rebase_start
+                if $rebase_start is "", set $rebase_start to merge base of $qb and $oqb
+                    if no common ancestor $qb and $oqb, set $rebase_start to last commit of $oqb
+                if $rebase_end = "N" is digit instead of commit id, get the Nth commit id as $rebase_end
+                if not $rebase_end, get most recent commit id in current HEAD as $rebase_end
+                then $rebase_start should be tag name, $rebase_end should be commit id
+            2. checkout at $qb, if working tree clean, declare temp tag $qb_tag at $rebase_end
+            3. do `git rebase --onto $oqb $rebase_start $qb_tag`, should checkout at temp branch
+            4. if _CONFLICT_MSG occurs in stdout, judge $rebase_until_conflict
+                if _FALSE: abort integrate commits, delete temp tags
+                if _TRUE: integrate commits until the last commit without conflict
+            5. after rebasing, add check point commit, declare temp tag $oqb_tag
+            6. checkout at $oqb, working tree should be clean
+            7. do `rebase $oqb_tag`, which is always fast-forward, so $oqb would update as $oqb_tag
+            8. select whether to update $rebase_start if it is a tag
+                if _TRUE: delete tag $rebase_start, declare tag $rebase_tag at $qb_tag
+            9. push $oqb, $rebase_start (if tag) to remote
+            10. delete temp tags $qb_tag, $oqb_tag, _TMP_PRE_TAG if exists
+        :type: all str
+        :param qb: name of qb branch, can be local like qb or remote like origin/qb or opensource/ob
+        :param oqb: name of oqb branch, should be local since we need to push it
+        :param rebase_start: start of integration, can be commit id or tag name
+        :param rebase_end: end of integration, current HEAD if "" else commit id, default ""
+        :param rebase_until_conflict: default _FALSE, if _TRUE integrate commits until meeting conflict
+        :return: _TRUE if success else _FALSE
+        '''
+        if rebase_end and rebase_end.isdigit():
+            welcome_msg = "From branch %s, integrate commits onto %s, from %s get %s commits" \
+                          % (qb, oqb, rebase_start, rebase_end)
+        else:
+            welcome_msg = "From branch %s, integrate commits onto %s, from %s to %s" \
+                        % (qb, oqb, rebase_start, rebase_end if rebase_end else "current HEAD")
+        Utility.show_help_msg(welcome_msg)
+
+        GitUtilities.current_dir()
+        if GitUtilities.fetch() == cls._FALSE:
+            Utility.show_help_msg("Integration abort because of fetch fault")
+            Utility.show()
+            return cls._FALSE
+
+        # check $qb, $oqb exist, status
+        # checkout $qb
+        Utility.show_help_msg("Check input branches")
+        if cls._FALSE == GitUtilities.check_branch_clean(oqb) or cls._FALSE == GitUtilities.check_branch_clean(qb):
+            Utility.show("Integration abort because of false checking input branches")
+            Utility.show()
+            return cls._FALSE
+
+        # check $rebase_start is tag or commit id or empty
+        # declare $pre_tag at $rebase_start
+        temp_tags = []  # name of temp tags
+        pre_tag = cls.check_rebase_start(qb, oqb, rebase_start)
+        if pre_tag == cls._TMP_PRE_TAG:
+            temp_tags.append(pre_tag)
+        Utility.show_help_msg("Start of commits integration is %s" % pre_tag)
+
+        # if rebase_end is digit, reset $rebase_end as commit id
+        if rebase_end and rebase_end.isdigit():
+            Utility.show_help_msg("Rebase end is digit, get %dth commit after %s" % (int(rebase_end), rebase_start))
+            rebase_end = GitUtilities.get_n_after_commit(pre_tag, rebase_end)
+
+        # count total commits
+        cnt_commits = GitUtilities.check_count_commits(pre_tag, end=rebase_end)
+        Utility.show("Total commits need to integrate is %d" % cnt_commits)
+        if cnt_commits == 0:
+            Utility.show("Integration stops because no patch to apply")
+            GitUtilities.clean_temp_tags(temp_tags)
+            Utility.show()
+            return cls._TRUE
+
+        # name of tags, check_point msg content
+        # cur_time = str(os.popen('date "+%H_%M_%d_%m_%y"').read()[:-1])
+        qb_tag = "v_qb_" + qb
+        oqb_tag = "v_oqb_" + oqb
+
+        # declare $qb_tag at $rebase_end
+        GitUtilities.current_branch()
+        Utility.show_help_msg("Declare tag %s at end of commits integration" % qb_tag)
+        GitUtilities.declare_tag(qb_tag, where=rebase_end)
+        temp_tags.append(qb_tag)
+        Utility.show_help_msg("Rebase branch %s onto %s from %s" % (qb, oqb, rebase_start))
+        rebase_out1, rebase_err1 = GitUtilities.rebase_onto(oqb, pre_tag, qb_tag)
+
+        # if CONFLICT occurs, which is frequently to happen
+        if [x for x in cls._CONFLICT_MSG if x in rebase_err1 or x in rebase_out1]:
+            GitUtilities.get_status()
+            conflict_id, place = GitUtilities.get_conflict_info(rebase_out1)
+            Utility.show_help_msg("CONFLICT in rebasing at %s" % conflict_id)
+            # if rebase_until_conflict=_TRUE and conflicts happens after 2nd commit
+            # integrate commits until last commit without conflict
+            if rebase_until_conflict == cls._TRUE and int(place) > 1:
+                    Utility.show_help_msg("Rebase until getting conflict")
+                    pre_id = GitUtilities.get_prev_id(conflict_id)
+                    GitUtilities.rebase_abort()
+                    GitUtilities.clean_temp_tags(temp_tags)
+                    return cls.integrate_commits(qb, oqb, pre_tag, pre_id)
+            else:
+                if cls._TRUE == Utility.select("Resolve CONFLICT manually? If [N] rebase will abort"):
+                    GitUtilities.resolve_conflict()
+                    status = GitUtilities.get_status()
+                    # if conflicts
+                    while [x for x in cls._STATUS_MSG if x in status]:
+                        choice = Utility.get_keyboard_input("CONFLICT? Resolve[R], Save[S], Abort[A]. [R/S/A]: ").lower()
+                        while choice != "r" and choice != "s" and choice != "a":
+                            print "Choose [R] to resolve conflict, [S] to save current progress, [A] to abort rebasing\n"
+                            choice = Utility.get_keyboard_input("CONFLICT? Resolve[R], Save[S], Abort[A]").lower()
+                        # resolve conflicts manually
+                        if choice == "r":
+                            GitUtilities.resolve_conflict()
+                            status = GitUtilities.get_status()
+                        # save rebasing process to $oqb
+                        elif choice == "s":
+                            temp_save_tag = "v_tmp_cp_tag"
+                            cur_conflict_id = cls.rebase_middle_save(qb, pre_tag, temp_save_tag)
+                            temp_tags.append(temp_save_tag)
+                            # update tag or not
+                            if cls._FALSE == cls.update_oqb(oqb, temp_save_tag):
+                                Utility.show("Abort integration because of rebase error")
+                                GitUtilities.clean_temp_tags(temp_tags)
+                                return cls._FALSE
+                            else:
+                                Utility.show("next conflict %s" % cur_conflict_id)
+                                cls.end_integration(pre_tag, temp_save_tag, oqb, temp_tags)
+                                return cls._TRUE
+                        # abort rebasing, no progress will save
+                        else:
+                            cls.abort_integration(qb, pre_tag, conflict_id, temp_tags)
+                            return cls._FALSE
+                # don't resolve conflicts, abort integration, no progress will save
+                else:
+                    cls.abort_integration(qb, pre_tag, conflict_id, temp_tags)
+                    return cls._FALSE
+
+        # no conflicts, then should be on temp branch
+        # add rebase check point commit and declare temp tag $oqb_tag
+        Utility.show_help_msg("Add check point commit and declare tag %s on %s" % (oqb_tag, oqb))
+        last_check_commit = GitUtilities.get_last_commit_contain_msg(cls._CHECK_POINT_MSG)
+        GitUtilities.add_check_point_commit(qb, pre_tag, qb_tag, last_check_commit, cls._CHECK_POINT_MSG)
+        GitUtilities.declare_tag(oqb_tag)
+        temp_tags.append(oqb_tag)
+
+        if cls._FALSE == cls.update_oqb(oqb, oqb_tag):
+            GitUtilities.clean_temp_tags(temp_tags)
+            return cls._FALSE
+        else:
+            cls.end_integration(pre_tag, qb_tag, oqb, temp_tags)
+            return cls._TRUE
+
+    @classmethod
+    def update_oqb(cls, oqb, oqb_tag):
+        '''
+        update oqb to oqb_tag
+        :param oqb: branch
+        :param oqb_tag: tag
+        :return: _TRUE if success else _FALSE
+        '''
+        # on $oqb, do fast-forward rebase to update
+        Utility.show_help_msg("Update %s to %s" % (oqb, oqb_tag))
+        GitUtilities.checkout_branch(oqb)
+        rebase_out, rebase_err = GitUtilities.rebase(oqb_tag)
+
+        # rebase err should not happen because it is always fast-forward
+        if rebase_err:
+            #Utility.pause("Pause because of rebase err in %s" % oqb)
+            GitUtilities.rebase_abort()
+            Utility.show("Abort integration because of rebase error")
+            return cls._FALSE
+        return cls._TRUE
+
+    @classmethod
+    def end_integration(cls, pre_tag, qb_tag, oqb, temp_tags):
+        '''
+        end of integration, including update tags if need
+        clean temp tags
+        push to remote if need
+        :param pre_tag: tag of rebasing start
+        :param qb_tag: tag of current rebasing HEAD
+        :param oqb: combined branch to push to remote
+        :param temp_tags: temp tags to delete
+        :return: null
+        '''
+        Utility.show_help_msg("Select to update tags and clean temp tags")
+        update_msg = "Update %s to %s" % (pre_tag, qb_tag)
+        if cls._TRUE == Utility.select(update_msg + "?"):
+            Utility.show_help_msg(update_msg)
+            GitUtilities.delete_tag(pre_tag)
+            GitUtilities.declare_tag(pre_tag, tag_msg=qb_tag, where=qb_tag)
+        else:
+            Utility.show_help_msg("No update to %s" % pre_tag)
+        GitUtilities.clean_temp_tags(temp_tags)
+
+        # push $oqb, tags
+        # Utility.show_help_msg("Push to remote")
+        # in case oqb is opensource branch or sth
+        #if cls._TRUE == Utility.select("Push branch %s to remote?" % oqb):
+        #    GitUtilities.push_branch(oqb, new=cls._TRUE)
+        # GitUtilities.push_branch()
+        # GitUtilities.push_tag()
+        Utility.show("Finished itegration to %s" % oqb)
+
+    @classmethod
+    def abort_integration(cls, qb, pre_tag, conflict_id, temp_tags):
+        '''
+        If conflicts in integration rebasing and do not choose to resolve it
+        And show related information
+        :param qb: branch we are taking commits from
+        :param pre_tag: start tag of rebasing
+        :param conflict_id: commit id which causes conflict
+        :param temp_tags: temp tags to delete
+        :return: null
+        '''
+        Utility.show_help_msg("Abort integration commits")
+        GitUtilities.rebase_abort()
+        cnt_num = GitUtilities.check_count_commits(pre_tag, conflict_id)
+        Utility.show("Abort integration because of CONFLICT at %s in %s" % (conflict_id, qb))
+        Utility.show("%d commits before this CONFLICT" % cnt_num)
+        GitUtilities.clean_temp_tags(temp_tags)
+
+    def check_oqb(self):
+        '''
+        Checking $self.oqb_name, if exists set a local copy of it and set it to local name
+        If it is local name like 'q-hive1_2-2.1.1', checkout a local copy
+        If local name doesn't exist choose whether to make a new one at current HEAD of branch $qb_name
+        If it is remote like 'origin/q-hive1_2-2.1.1' or 'opensource/branch-2.2', checkout a local copy
+        If remote source doesn't exist print error message
+        :return: if checkout a local copy return _TRUE else _FALSE
+        '''
+        Utility.show_help_msg("Set oqb branch %s at local" % self.oqb_name)
+        remote_qb_name = self._ORIGIN + "/" + self.qb_name
+        remote_op_name = self._OPENSOURCE + "/" + self.op_name
+        out1, err1 = GitUtilities.checkout_branch(self.oqb_name)
+        if "did not match any file(s) known to git" in err1:
+            # This if part just for test case, since it is assumed that $oqb always exist
+            if "/" in self.oqb_name:
+                Utility.show("Unknown source of branch %s" % self.oqb_name)
+                return self._FALSE
+            choice = Utility.get_keyboard_input("Declare a new branch %s at current HEAD of %s[1] or merge base of %s and %s[2]? [1/2]: " %
+                                                (self.oqb_name, self.qb_name, self.qb_name, self.op_name))
+            while choice != "1" and choice != "2":
+                choice = Utility.get_keyboard_input("current HEAD[1], merge base[2]")
+            if choice == "2":
+                choice_1 = Utility.select("Make a new branch of %s at merge-base of %s and %s?"
+                                          % (self.oqb_name, self.qb_name, self.op_name))
+                if choice_1 == self._TRUE:
+                    if self._FALSE == self.initialize_oqb(remote_qb_name, remote_op_name, self.oqb_name, merge_base=self._TRUE):
+                        Utility.show("False initialize %s because of no merge-base" % self.oqb_name)
+                        return self._FALSE
+                else:
+                    Utility.show("No oqb branch %s exists, integration abort" % self.oqb_name)
+                    return self._FALSE
+            else:
+                choice_2 = Utility.select("Make a new branch of %s at current HEAD of %s?"
+                                          % (self.oqb_name, self.qb_name))
+                if choice_2 == self._TRUE:
+                    if choice_2 == self._TRUE:
+                        if self._FALSE == self.initialize_oqb(remote_qb_name, remote_op_name, self.oqb_name, qb_cur_HEAD=self._TRUE):
+                            Utility.show("False initialize %s" % self.oqb_name)
+                            return self._FALSE
+                    else:
+                        Utility.show("No oqb branch %s exists, integration abort" % self.oqb_name)
+                        return self._FALSE
+        else:
+            if "/" in self.oqb_name:
+                # set local branch
+                GitUtilities.checkout_branch(GitUtilities.local_name(self.oqb_name), new=self._TRUE, where=self.oqb_name)
+        # local name for making commits and push
+        self.oqb_name = GitUtilities.local_name(self.oqb_name)
+        return self._TRUE
+
+    @classmethod
+    def rebase_middle_save(cls, source_branch, rebase_start, temp_save_tag="v_tmp_save_point"):
+        '''
+        In rebasing progress, if stop at the middle and save what have been resolved
+        What happens is:
+            at the middle of rebasing, first save the current commit id causing CONFLICT
+            then checkout at ours, $git checkout . --ours
+            then add dummy commit $git commit --allow-empty -m "qubole commit message"
+            then declare a temp tag $tmp_save_tag, $git tag v_temp_save_point
+            then fast forward rebase the target branch, possibly update $oqb branch to $tmp_save_tag
+            this temp tag will be removed when scrip finished
+        :param source_branch: from which branch we are picking commits
+        :param conflict_msg: message return when getting conflicts
+        :return: commit id of the conflict we do not resolve
+        '''
+        commit_id = GitUtilities.conflict_id_during_rebase()
+        GitUtilities.rebase_checkout_ours()
+        GitUtilities.git_add_all()
+        last_check_commit = GitUtilities.get_last_commit_contain_msg(cls._CHECK_POINT_MSG)
+        start_commit = GitUtilities.get_last_commit(rebase_start)
+        end_commit_id = GitUtilities.get_last_n_commit_id(2, commit_id)
+        end_commit = GitUtilities.get_last_commit(end_commit_id)
+        GitUtilities.add_check_point_with_commit(source_branch, start_commit, end_commit, last_check_commit, cls._CHECK_POINT_MSG)
+        GitUtilities.declare_tag(temp_save_tag)
+        GitUtilities.rebase_abort()
+        Utility.show("Save current process until conflict %s to tag %s" %(commit_id, temp_save_tag))
+        return commit_id
+
+    def integrate_branches(self):
+        '''
+        Whole process of git integration:
+        1. set_up(), clone repo to current dir and cd to git repo
+        2. checkout oqb branch to local
+        3. get qb commits: integrate_commits($qb_name, $oqb_name, $qb_start, $qb_end) if $qb_start
+        4. get ob commits: integrate_commits($op_name, $oqb_name, $op_start, $op_end) if $op_start
+        5. if delete repo: clean()
+        :return: _TRUE if success else _FALSE
+        '''
+        ret = self._TRUE
+        ret = ret and self.set_up()
+        if ret == self._FALSE:
+            Utility.show_help_msg("Error in set_up()")
+            return
+        # if self.branch name contains remote name, turn to local name
+        self.op_name = GitUtilities.local_name(self.op_name)
+        self.qb_name = GitUtilities.local_name(self.qb_name)
+        remote_qb_name = self._ORIGIN + "/" + self.qb_name
+        remote_op_name = self._OPENSOURCE + "/" + self.op_name
+        # set local copy of oqb if exist
+        if self._FALSE == self.check_oqb():
+            Utility.show("Integration abort because false checking branch %s" % self.oqb_name)
+            return self._FALSE
+        Utility.show("Start integration commits")
+        # integration commits, from branch whose name exists
+        # using remote such as opensource/ob and origin/qb in case $qb_name == $op_name
+        if self.qb_name:
+            ret = ret and self.integrate_commits(remote_qb_name, self.oqb_name, self.qb_start, self.qb_end)
+        if self.op_name:
+            ret = ret and self.integrate_commits(remote_op_name, self.oqb_name, self.op_start, self.op_end)
+        if ret == self._TRUE:
+            #Utility.compile()
+            Utility.show("Finish git integration")
+        else:
+            Utility.show("Error in integrate_commits(), integration abort")
+        self.clean()
+        Utility.show()
+        return ret
+
+    @classmethod
+    def initialize_oqb(cls, qb_branch, op_branch, oqb_branch, pre_qtag="", pre_otag="",
+                       qb_commit="", op_commit="", merge_base=_FALSE, qb_cur_HEAD=_FALSE):
+        '''
+        if oqb is not existed, initialize oqb from qb and op
+        probably not used
+        Process:
+            1. checkout $qb_branch, declare $qb_tag at $qb_commit (or current HEAD)
+            2. checkout $qb_tag as temp branch, add check point commit, declare $oqb_tag
+            3. checkout $op_branch, declare op_tag at $op_commit (or current HEAD)
+            4. checkout $op_tag as temp branch, rebase on $oqb_tag
+            5. add check point commit on temp branch, checkout as new $oqb_branch
+            6. make $pre_qtag at $qb_tag, and $pre_otag at $op_tag, if choose to do so
+            7. push $pre_qtag, $pre_otag, $oqb to remote, delete tags $qb_tag, $op_tag, $oqb_tag
+        :type: all str
+        :param qb_branch: name of qb
+        :param op_branch: name of ob
+        :param oqb_branch: name of oqb
+        :param pre_qtag: name of pre_qtag to be declared
+        :param pre_otag: name of pre_otag to be declared
+        :param qb_commit: default "", means current HEAD
+        :param op_commit: default "", means current HEAD
+        :param merge_base: default _FALSE, if _TRUE declare $oqb_branch at merge base of $qb_branch and $op_branch
+        :param qb_cur_HEAD: default _FALSE, if _TRUE declare $oqb_branch at current HEAD of $qb_branch
+        :return: _TRUE if success else _FALSE
+        '''
+        if merge_base == cls._FALSE and qb_cur_HEAD == cls._FALSE:
+            welcome_msg = "From branch %s from beginning to %s, and branch %s, from beginning to %s, initialize combined branch %s" \
+                        % (qb_branch, (qb_commit if qb_commit else "current HEAD"),
+                          op_branch, (op_commit if op_commit else "current HEAD"), oqb_branch)
+        elif qb_cur_HEAD == cls._FALSE:
+            welcome_msg = "From branch %s and branch %s initialize combined branch %s to merge-base" \
+                          % (qb_branch, op_branch, oqb_branch)
+        else:
+            welcome_msg = "Initialize branch %s at current HEAD of %s" \
+                          % (oqb_branch, qb_branch)
+        Utility.show_help_msg(welcome_msg)
+
+        if merge_base == cls._TRUE:
+            GitUtilities.fetch()
+            ancestor = GitUtilities.merge_base(qb_branch, op_branch)
+            if not ancestor:
+                Utility.show_help_msg("No merge base")
+                return cls._FALSE
+            GitUtilities.checkout_branch(qb_branch)
+            start_tag = "v_start_oqb"
+            GitUtilities.declare_tag(start_tag, where=ancestor)
+            GitUtilities.checkout_branch(start_tag)
+            GitUtilities.add_check_point_commit(op_branch, "", start_tag, "", cls._CHECK_POINT_MSG, init=cls._TRUE)
+            GitUtilities.checkout_branch(oqb_branch, new=cls._TRUE)
+            GitUtilities.delete_tag(start_tag)
+            # GitUtilities.push_branch(oqb_branch)
+            if pre_qtag and pre_otag:
+                if cls._TRUE == Utility.select("Declare new tags %s %s?" % (pre_qtag, pre_otag)):
+                    GitUtilities.checkout_branch(qb_branch)
+                    GitUtilities.declare_tag(pre_qtag, where=ancestor)
+                    GitUtilities.checkout_branch(op_branch)
+                    GitUtilities.declare_tag(pre_otag, where=ancestor)
+            Utility.show("Initialize %s at %s" % (oqb_branch, ancestor))
+            Utility.show()
+            return cls._TRUE
+
+        if qb_cur_HEAD == cls._TRUE:
+            GitUtilities.fetch()
+            cur_HEAD = GitUtilities.get_last_commit_id(qb_branch)
+            GitUtilities.checkout_branch(qb_branch)
+            start_tag = "v_start_oqb"
+            GitUtilities.declare_tag(start_tag, where=cur_HEAD)
+            GitUtilities.checkout_branch(start_tag)
+            GitUtilities.add_check_point_commit(op_branch, "", start_tag, "", cls._CHECK_POINT_MSG, init=cls._TRUE)
+            GitUtilities.checkout_branch(oqb_branch, new=cls._TRUE)
+            GitUtilities.delete_tag(start_tag)
+            # GitUtilities.push_branch(oqb_branch)
+            if pre_qtag and pre_otag:
+                if cls._TRUE == Utility.select("Declare new tags %s %s?" % (pre_qtag, pre_otag)):
+                    GitUtilities.checkout_branch(qb_branch)
+                    GitUtilities.declare_tag(pre_qtag, where=cur_HEAD)
+                    GitUtilities.checkout_branch(op_branch)
+                    GitUtilities.declare_tag(pre_otag, where=cur_HEAD)
+            Utility.show("Initialize %s at %s" % (oqb_branch, cur_HEAD))
+            Utility.show()
+            return cls._TRUE
+
+
+        if GitUtilities.fetch() == cls._FALSE:
+            return cls._FALSE
+
+        qb_tag = "v_qb_" + qb_branch
+        op_tag = "v_op_" + op_branch
+        oqb_tag = "v_oqb_" + oqb_branch
+
+        # at qb_branch
+        GitUtilities.check_branch_exist(op_branch)
+        GitUtilities.check_status("working tree clean")
+        GitUtilities.check_branch_exist(qb_branch)
+        GitUtilities.check_status("working tree clean")
+
+        GitUtilities.declare_tag(qb_tag, where=qb_commit)
+        GitUtilities.checkout_branch(qb_tag)
+        GitUtilities.add_check_point_commit(qb_branch, "", qb_tag, "", cls._CHECK_POINT_MSG, init=cls._TRUE)
+        GitUtilities.declare_tag(oqb_tag)
+
+        # at op_branch, here declare upstream
+        GitUtilities.checkout_branch(op_branch)
+        GitUtilities.declare_tag(op_tag, where=op_commit)
+        GitUtilities.checkout_branch(op_tag)
+        GitUtilities.rebase(oqb_tag)
+        GitUtilities.add_check_point_commit(op_branch, "", op_tag, "", cls._CHECK_POINT_MSG, init=cls._TRUE)
+        GitUtilities.checkout_branch(oqb_branch, new=cls._TRUE)
+
+        # delete tmp tag
+        select_msg = "Declare tag %s at %s and tag %s at %s ?" % (pre_qtag, qb_tag, pre_otag, op_tag)
+        if cls._TRUE == Utility.select(select_msg):
+            GitUtilities.declare_tag(pre_qtag, qb_tag, qb_tag)
+            GitUtilities.declare_tag(pre_otag, op_tag, op_tag)
+        GitUtilities.delete_tag(qb_tag)
+        GitUtilities.delete_tag(op_tag)
+        GitUtilities.delete_tag(oqb_tag)
+        #GitUtilities.push_tag()
+        #GitUtilities.push_branch(oqb_branch)
+        Utility.show("Finish initialize %s, from %s to %s, and %s to %s. Declare tag %s, %s." \
+             % (oqb_branch, qb_branch, (qb_commit if qb_commit else "current HEAD")
+                , op_branch, (op_commit if op_commit else "current HEAD"), pre_qtag, pre_otag))
+        Utility.show()
+        return cls._TRUE
+
+
+def main():
+    '''
+    Get arguments and run git integration in main
+    '''
+    # get input arguments from command line
+    parser = argparse.ArgumentParser()
+    parser.add_argument('-qu', '--qb_url', help='url of qubole repo', required=True)
+    parser.add_argument('-ou', '--op_url', help='url of opensource repo', required=True)
+    parser.add_argument('-qn', '--qb_name', help='name of qb branch')
+    parser.add_argument('-on', '--ob_name', help='name of ob branch')
+    parser.add_argument('-oqn', '--oqb_name', help='name of oqb branch', required=True)
+    parser.add_argument('-qs', '--qb_start', help='rebase start of qb branch')
+    parser.add_argument('-os', '--op_start', help='rebase start of op branch')
+    parser.add_argument('-qe', '--qb_end', help='rebase end of qb branch')
+    parser.add_argument('-oe', '--op_end', help='rebase end of op branch')
+    parser.add_argument('-rn', '--repo_name', help='name of repo')
+    args = vars(parser.parse_args())
+    # all input should be str
+    for key in args.keys():
+        if args[key]:
+            args[key] = str(args[key])
+        else:
+            args[key] = ""
+    Utility.show_help_msg(args)
+    # check input
+    if not args['qb_name'] and not args['ob_name']:
+        Utility.show_help_msg("At least one of arguments --qb_name/--op_name is required")
+        return
+    # git integration
+    git_integration_job = GitIntegration(args['qb_url'], args['op_url'], args['qb_name'], args['ob_name'],
+                                        args['oqb_name'], args['qb_start'], args['op_start'], args['qb_end'],
+                                        args['op_end'], args['repo_name'])
+    git_integration_job.integrate_branches()
+    return
+
+
+if __name__== "__main__":
+   main()
