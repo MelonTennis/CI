@@ -7,7 +7,7 @@ No description
 
 10 kinds of work, one not interesting, the other don't know how to do
 
-10 kinds of people, one know binary, the other don't ;)
+10 kinds of people, one knows binary, the other doesn't ;)
 
 ...I seem not like making more than 40 animations in one PPT \_(:з」∠)\_ 
 
